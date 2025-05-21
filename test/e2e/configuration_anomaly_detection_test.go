@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -299,23 +300,23 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			sgID, err := awsCli.GetSecurityGroupID(infraID)
 			Expect(err).NotTo(HaveOccurred(), "Failed to get security group ID")
 
-			logs, err := GetServiceLogs(ocmCli, cluster)
-			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs")
-			logsAfter := logs.Items().Slice()
-			for i, item := range logsAfter {
-				fmt.Printf("Log #%d:\n", i+1)
-				fmt.Printf("  - ID: %s\n", item.ID())
-				fmt.Printf("  - Summary: %s\n", item.Summary())
-				fmt.Printf("  - CreatedAt: %s\n", item.CreatedAt())
+			// Step 1: Get logs before action
+			ginkgo.GinkgoWriter.Printf("Step 1:Fetching service logs before action\n")
+			logsBefore, err := GetServiceLogs(ocmCli, cluster)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs before action")
+
+			existingLogIDs := map[string]bool{}
+			for _, item := range logsBefore.Items().Slice() {
+				existingLogIDs[item.ID()] = true
 			}
 
-			// Step 1: Block egress
+			// Step 2: Block egress
 			Expect(BlockEgress(ctx, ec2Wrapper, sgID)).To(Succeed(), "Failed to block egress")
-			ginkgo.GinkgoWriter.Printf("Egress blocked\n")
+			ginkgo.GinkgoWriter.Printf("Step 2: Egress blocked\n")
 
+			// Step 3: Scale down insights-operator
 			var zero int32 = 0
-			// Step 2: Scale down insights-operator with retry
-			fmt.Println("Step 2: Scaling down insights-operator")
+			fmt.Println("Step 3: Scaling down insights-operator")
 			var originalIOReplicas int32
 			err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				io := &appsv1.Deployment{}
@@ -329,16 +330,21 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			})
 			Expect(err).ToNot(HaveOccurred(), "failed to scale down insights-operator")
 			fmt.Printf("Scaled down insights-operator from %d to 0 replicas\n", originalIOReplicas)
-			// Step 3: Get service logs
-			logs, err = GetServiceLogs(ocmCli, cluster)
-			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs")
-			logsAfter = logs.Items().Slice()
-			for i, item := range logsAfter {
-				fmt.Printf("Log #%d:\n", i+1)
-				fmt.Printf("  - ID: %s\n", item.ID())
-				fmt.Printf("  - Summary: %s\n", item.Summary())
-				fmt.Printf("  - CreatedAt: %s\n", item.CreatedAt())
+
+			// Step 4: Get logs again and find new entries
+			logsAfter, err := GetServiceLogs(ocmCli, cluster)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs after action")
+
+			newLogs := []interface{}{}
+			for _, item := range logsAfter.Items().Slice() {
+				if !existingLogIDs[item.ID()] {
+					newLogs = append(newLogs, item)
+				}
 			}
+
+			// Step 4: Verify no new logs were created
+			Expect(len(newLogs)).To(BeZero(), "Expected no new service logs after blocking egress and scaling down")
+
 			// Restore egress
 			Expect(RestoreEgress(ctx, ec2Wrapper, sgID)).To(Succeed(), "Failed to restore egress")
 			ginkgo.GinkgoWriter.Printf("Egress restored\n")
