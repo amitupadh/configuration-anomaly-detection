@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -115,7 +114,7 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			Expect(BlockEgress(ctx, ec2Wrapper, sgID)).To(Succeed(), "Failed to block egress")
 			ginkgo.GinkgoWriter.Printf("Egress blocked\n")
 
-			time.Sleep(20 * time.Minute)
+			time.Sleep(1 * time.Minute)
 
 			lsResponseAfter, err := GetLimitedSupportReasons(ocme2eCli, clusterID)
 			Expect(err).NotTo(HaveOccurred(), "Failed to get limited support reasons")
@@ -205,7 +204,7 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			Expect(err).ToNot(HaveOccurred(), "failed to scale down alertmanager")
 			fmt.Printf("Alertmanager scaled down from %d to 0 replicas. Waiting...\n", originalAMReplicas)
 
-			time.Sleep(20 * time.Minute)
+			time.Sleep(1 * time.Minute)
 
 			logs, err = GetServiceLogs(ocmCli, cluster)
 			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs")
@@ -264,6 +263,85 @@ var _ = Describe("Configuration Anomaly Detection", Ordered, func() {
 			Expect(lsReasonsAfter).To(Equal(lsReasonsBefore), "Limited support reasons changed after scale down/up")
 
 			fmt.Println("Test completed: All components restored to original replica counts.")
+		}
+	})
+
+	It("AWS CCS: InsightsOperatorDown (blocked egress)", Label("aws", "ccs", "insights-operator", "blocking-egress"), func(ctx context.Context) {
+		if provider == "aws" {
+			awsAccessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+			awsSecretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+			Expect(awsAccessKey).NotTo(BeEmpty(), "AWS access key not found")
+			Expect(awsSecretKey).NotTo(BeEmpty(), "AWS secret key not found")
+
+			awsCfg, err := config.LoadDefaultConfig(ctx,
+				config.WithRegion(region),
+				config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+					awsAccessKey,
+					awsSecretKey,
+					"",
+				)),
+			)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create AWS config")
+
+			ec2Client := ec2.NewFromConfig(awsCfg)
+			ec2Wrapper := NewEC2ClientWrapper(ec2Client)
+
+			awsCli, err := awsinternal.NewClient(awsCfg)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create AWS client")
+
+			clusterResource, err := ocme2eCli.ClustersMgmt().V1().Clusters().Cluster(clusterID).Get().Send()
+			Expect(err).NotTo(HaveOccurred(), "Failed to fetch cluster from OCM")
+
+			cluster := clusterResource.Body()
+			infraID := cluster.InfraID()
+			Expect(infraID).NotTo(BeEmpty(), "InfraID missing from cluster")
+
+			sgID, err := awsCli.GetSecurityGroupID(infraID)
+			Expect(err).NotTo(HaveOccurred(), "Failed to get security group ID")
+
+			logs, err := GetServiceLogs(ocmCli, cluster)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs")
+			logsAfter := logs.Items().Slice()
+			for i, item := range logsAfter {
+				fmt.Printf("Log #%d:\n", i+1)
+				fmt.Printf("  - ID: %s\n", item.ID())
+				fmt.Printf("  - Summary: %s\n", item.Summary())
+				fmt.Printf("  - CreatedAt: %s\n", item.CreatedAt())
+			}
+
+			// Step 1: Block egress
+			Expect(BlockEgress(ctx, ec2Wrapper, sgID)).To(Succeed(), "Failed to block egress")
+			ginkgo.GinkgoWriter.Printf("Egress blocked\n")
+
+			var zero int32 = 0
+			// Step 2: Scale down insights-operator with retry
+			fmt.Println("Step 2: Scaling down insights-operator")
+			var originalIOReplicas int32
+			err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				io := &appsv1.Deployment{}
+				err := k8s.Get(ctx, "insights-operator", "openshift-insights", io)
+				if err != nil {
+					return err
+				}
+				originalIOReplicas = *io.Spec.Replicas
+				io.Spec.Replicas = &zero
+				return k8s.Update(ctx, io)
+			})
+			Expect(err).ToNot(HaveOccurred(), "failed to scale down insights-operator")
+			fmt.Printf("Scaled down insights-operator from %d to 0 replicas\n", originalIOReplicas)
+			// Step 3: Get service logs
+			logs, err = GetServiceLogs(ocmCli, cluster)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get service logs")
+			logsAfter = logs.Items().Slice()
+			for i, item := range logsAfter {
+				fmt.Printf("Log #%d:\n", i+1)
+				fmt.Printf("  - ID: %s\n", item.ID())
+				fmt.Printf("  - Summary: %s\n", item.Summary())
+				fmt.Printf("  - CreatedAt: %s\n", item.CreatedAt())
+			}
+			// Restore egress
+			Expect(RestoreEgress(ctx, ec2Wrapper, sgID)).To(Succeed(), "Failed to restore egress")
+			ginkgo.GinkgoWriter.Printf("Egress restored\n")
 		}
 	})
 })
